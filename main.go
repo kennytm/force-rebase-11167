@@ -10,10 +10,14 @@ import (
 	"github.com/go-sql-driver/mysql" // MySQL Driver
 )
 
+type tableName struct {
+	Schema string
+	Table  string
+}
+
 // tableInfo is the fully-qualified table name + the calculated auto_increment value
 type tableInfo struct {
-	Schema  string
-	Table   string
+	tableName
 	AutoInc int64
 }
 
@@ -62,9 +66,14 @@ func main() {
 
 	log.Println("# Database connection successful.")
 
-	var tableInfos []tableInfo
+	// 2.5. Obtain the shard_row_id_bits.
+	shardRowIDBits, err := collectShardRowIDBits(db, schemas)
+	if err != nil {
+		log.Fatalf("! Error collecting shard_row_id_bits: %v\n", err)
+	}
 
 	// 3. Iterate through schemas and tables to find max row IDs
+	var tableInfos []tableInfo
 	for _, schema := range schemas {
 		log.Printf("# Processing schema: %s\n", schema)
 
@@ -76,7 +85,9 @@ func main() {
 
 		// 4. For each table, get max _tidb_rowid
 		for _, table := range tables {
-			maxID, err := getMaxRowID(db, schema, table)
+			tableName := tableName{Schema: schema, Table: table}
+			shardRowIDBit, _ := shardRowIDBits[tableName]
+			maxID, err := getMaxRowID(db, schema, table, shardRowIDBit)
 			if maxID == 0 {
 				if err != nil {
 					log.Printf("!    Skipping table %s.%s: %v.\n", schema, table, err)
@@ -85,7 +96,7 @@ func main() {
 			}
 
 			// Store the valid result
-			tableInfos = append(tableInfos, tableInfo{Schema: schema, Table: table, AutoInc: maxID + 1})
+			tableInfos = append(tableInfos, tableInfo{tableName: tableName, AutoInc: maxID + 1})
 		}
 	}
 
@@ -133,8 +144,9 @@ func getTablesInSchema(db *sql.DB, schemaName string) ([]string, error) {
 }
 
 // getMaxRowID queries the maximum _tidb_rowid for a specific table.
-func getMaxRowID(db *sql.DB, schemaName, tableName string) (int64, error) {
-	query := fmt.Sprintf("SELECT coalesce(max(_tidb_rowid), 0) FROM `%s`.`%s`", schemaName, tableName)
+func getMaxRowID(db *sql.DB, schemaName, tableName string, shardRowIDBit uint64) (int64, error) {
+	mask := (1 << (63 - shardRowIDBit)) - 1
+	query := fmt.Sprintf("SELECT coalesce(max(_tidb_rowid & %d), 0) FROM `%s`.`%s`", mask, schemaName, tableName)
 	var maxID int64
 	err := db.QueryRow(query).Scan(&maxID)
 
@@ -219,4 +231,40 @@ func compareAutoIncrement(db *sql.DB, t *tableInfo) error {
 	}
 
 	return nil
+}
+
+func collectShardRowIDBits(db *sql.DB, schemas []string) (map[tableName]uint64, error) {
+	var query strings.Builder
+	query.WriteString("select table_schema, table_name, cast(substr(tidb_row_id_sharding_info, 12) as unsigned) bits from information_schema.tables where table_schema in (")
+	for i, schema := range schemas {
+		if i != 0 {
+			query.WriteByte(',')
+		}
+		query.WriteByte('"')
+		query.WriteString(schema) // TODO: escape?
+		query.WriteByte('"')
+	}
+	query.WriteString(") and tidb_row_id_sharding_info like 'SHARD_BITS=%';")
+
+	rows, err := db.Query(query.String())
+	if err != nil {
+		return nil, fmt.Errorf("querying shard_row_id_bits: %w", err)
+	}
+	defer rows.Close()
+
+	shardRowIDBits := make(map[tableName]uint64)
+	for rows.Next() {
+		var name tableName
+		var bits uint64
+		if err := rows.Scan(&name.Schema, &name.Table, &bits); err != nil {
+			return nil, fmt.Errorf("scanning shard_row_id_bits row: %w", err)
+		}
+		shardRowIDBits[name] = bits
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating shard_row_id_bits rows: %w", err)
+	}
+
+	return shardRowIDBits, nil
 }
